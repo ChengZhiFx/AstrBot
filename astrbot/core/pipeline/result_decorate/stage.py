@@ -206,11 +206,17 @@ class ResultDecorateStage(Stage):
                         break
 
             # 分段回复
-            if self.enable_segmented_reply and event.get_platform_name() not in [
-                "qq_official_webhook",
-                "weixin_official_account",
-                "dingtalk",
-            ]:
+            # OneBot replies share the delivery-stage text splitter with the message tool.
+            qq_model_reply = result.is_model_result() and event.get_platform_name() == "aiocqhttp"
+            if (
+                self.enable_segmented_reply
+                and not qq_model_reply
+                and event.get_platform_name() not in [
+                    "qq_official_webhook",
+                    "weixin_official_account",
+                    "dingtalk",
+                ]
+            ):
                 if (
                     self.only_llm_result and result.is_model_result()
                 ) or not self.only_llm_result:

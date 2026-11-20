@@ -10,6 +10,7 @@ from astrbot.core.platform.button_interaction import (
     decode_button_callback,
 )
 from astrbot.core.star.filter.button_action import ButtonActionFilter
+from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.filter.permission import PermissionTypeFilter
 from astrbot.core.star.session_plugin_manager import SessionPluginManager
@@ -209,14 +210,20 @@ class WakingCheckStage(Stage):
                     elif not filter.filter(event, self.ctx.astrbot_config):
                         passed = False
                         break
-                except Exception as e:
-                    await event.send(
-                        MessageEventResult()
-                        .message(
-                            f"插件 {star_map[handler.handler_module_path].name}: {e}",
+                except Exception:
+                    logger.exception("Plugin event filter failed: %s", handler.handler_module_path)
+                    if isinstance(filter, CommandFilter):
+                        await event.send(
+                            MessageEventResult()
+                            .message("指令参数无效。用法：" + filter.print_types())
+                            .use_markdown(False),
                         )
-                        .use_markdown(False),
-                    )
+                    elif isinstance(filter, CommandGroupFilter):
+                        await event.send(
+                            MessageEventResult()
+                            .message("请核对指令组的子指令和参数。")
+                            .use_markdown(False),
+                        )
                     event.stop_event()
                     passed = False
                     break

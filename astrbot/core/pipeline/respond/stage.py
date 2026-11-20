@@ -4,6 +4,7 @@ import random
 from collections.abc import AsyncGenerator
 
 import astrbot.core.message.components as Comp
+from astrbot.core.utils.qq_chat_text import split_qq_text, suppress_qq_final
 from astrbot.core import logger
 from astrbot.core.message.components import BaseMessageComponent, ComponentType
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
@@ -94,6 +95,7 @@ class RespondStage(Stage):
             "segmented_reply"
         ]["only_llm_result"]
 
+
         self.interval_method = ctx.astrbot_config["platform_settings"][
             "segmented_reply"
         ]["interval_method"]
@@ -130,6 +132,41 @@ class RespondStage(Stage):
             return random.uniform(1, 1.75)
         # random
         return random.uniform(self.interval[0], self.interval[1])
+
+    def _split_qq_text_bubbles(self, comp: BaseMessageComponent) -> list[BaseMessageComponent]:
+        if not isinstance(comp, Comp.Plain):
+            return [comp]
+        return [Comp.Plain(text) for text in split_qq_text(comp.text)]
+
+    async def _send_reply_piece(self, event, result, components, *, separate=False):
+        from astrbot.core.utils.qq_chat_text import (
+            CHATPLUS_REPLY,
+            LLM_REPLY_DELIVERED,
+            LLM_TEXT_DELIVERED,
+            QQ_QUOTE_IF_GAP,
+            QQ_REPLY_STARTED,
+        )
+
+        is_qq_reply = (
+            not separate and result.is_model_result() and event.get_extra(CHATPLUS_REPLY)
+        )
+        first_piece = is_qq_reply and not event.get_extra(QQ_REPLY_STARTED)
+        if first_piece and not any(isinstance(component, Comp.Reply) for component in components):
+            quote_if_gap = event.get_extra(QQ_QUOTE_IF_GAP)
+            if quote_if_gap is not None and quote_if_gap():
+                components = [Comp.Reply(id=event.message_obj.message_id), *components]
+
+        await event.send(result.derive(components))
+        if result.is_llm_result():
+            event.set_extra(LLM_REPLY_DELIVERED, True)
+
+        if is_qq_reply and getattr(event, "_has_send_oper", False):
+            event.set_extra(QQ_REPLY_STARTED, True)
+            delivered = [component.text for component in components if isinstance(component, Comp.Plain)]
+            if delivered:
+                event.set_extra(
+                    LLM_TEXT_DELIVERED, (event.get_extra(LLM_TEXT_DELIVERED) or []) + delivered
+                )
 
     async def _is_empty_message_chain(self, chain: list[BaseMessageComponent]) -> bool:
         """检查消息链是否为空
@@ -217,8 +254,10 @@ class RespondStage(Stage):
         result_plain_text = result.get_plain_text().strip()
         if (
             result_plain_text
-            and isinstance(sent_plain_texts, list)
-            and result_plain_text in sent_plain_texts
+            and (
+                (result.is_model_result() and suppress_qq_final(event, result_plain_text))
+                or (isinstance(sent_plain_texts, list) and result_plain_text in sent_plain_texts)
+            )
             and all(
                 comp.type
                 in {
@@ -230,7 +269,7 @@ class RespondStage(Stage):
             )
         ):
             logger.info(
-                "send_message_to_user already delivered the same text in this session, skip respond stage to avoid duplicate reply.",
+                "QQ final text suppressed by the reply policy or already delivered by the message tool.",
             )
             return
 
@@ -338,6 +377,16 @@ class RespondStage(Stage):
             # Record 需要强制单独发送
             need_separately = {ComponentType.Record}
             if self.is_seg_reply_required(event):
+                if (
+                    result.is_model_result()
+                    and event.get_platform_name() == "aiocqhttp"
+                ):
+                    # Split after decoration, with quote/mention only on the first bubble.
+                    result.chain = [
+                        bubble
+                        for comp in result.chain
+                        for bubble in self._split_qq_text_bubbles(comp)
+                    ]
                 header_comps = self._extract_comp(
                     result.chain,
                     {ComponentType.Reply, ComponentType.At},
@@ -356,9 +405,9 @@ class RespondStage(Stage):
                     await asyncio.sleep(i)
                     try:
                         if comp.type in need_separately:
-                            await event.send(result.derive([comp]))
+                            await self._send_reply_piece(event, result, [comp], separate=True)
                         else:
-                            await event.send(result.derive([*header_comps, comp]))
+                            await self._send_reply_piece(event, result, [*header_comps, comp])
                             header_comps.clear()
                     except Exception as e:
                         logger.error(
@@ -385,7 +434,7 @@ class RespondStage(Stage):
                 for comp in sep_comps:
                     chain = result.derive([comp])
                     try:
-                        await event.send(chain)
+                        await self._send_reply_piece(event, result, [comp], separate=True)
                     except Exception as e:
                         logger.error(
                             f"Failed to send the message chain: chain = {chain}, "
@@ -395,7 +444,7 @@ class RespondStage(Stage):
                 chain = result.derive(result.chain)
                 if result.chain and len(result.chain) > 0:
                     try:
-                        await event.send(chain)
+                        await self._send_reply_piece(event, result, result.chain)
                     except Exception as e:
                         logger.error(
                             f"Failed to send the message chain: chain = {chain}, "
